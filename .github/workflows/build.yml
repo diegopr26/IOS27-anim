@@ -1,0 +1,245 @@
+name: Build LSPosed module
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Create project
+        run: |
+          set -e
+          D=app/src/main/java/com/ios27/anim
+          S=xposedstub/src/main/java/de/robv/android/xposed
+          mkdir -p $D $S/callbacks app/src/main/assets app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'iOS27'
+          include ':app', ':xposedstub'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+
+          cat > xposedstub/build.gradle <<'EOF'
+          plugins { id 'java-library' }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.ios27.anim'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.ios27.anim'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies { compileOnly project(':xposedstub') }
+          EOF
+
+          cat > $S/IXposedHookLoadPackage.java <<'EOF'
+          package de.robv.android.xposed;
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam lpparam) throws Throwable;
+          }
+          EOF
+          cat > $S/callbacks/XC_LoadPackage.java <<'EOF'
+          package de.robv.android.xposed.callbacks;
+          public abstract class XC_LoadPackage {
+              public static class LoadPackageParam {
+                  public String packageName;
+                  public ClassLoader classLoader;
+              }
+          }
+          EOF
+          cat > $S/XC_MethodHook.java <<'EOF'
+          package de.robv.android.xposed;
+          public abstract class XC_MethodHook {
+              public XC_MethodHook() {}
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
+              public static class MethodHookParam {
+                  public Object[] args;
+                  public Object thisObject;
+                  public void setResult(Object result) {}
+                  public Object getResult() { return null; }
+              }
+              public static class Unhook {}
+          }
+          EOF
+          cat > $S/XposedBridge.java <<'EOF'
+          package de.robv.android.xposed;
+          import java.util.Set;
+          public final class XposedBridge {
+              public static void log(String text) {}
+              public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> c, String name, XC_MethodHook cb) { return null; }
+          }
+          EOF
+          cat > $S/XposedHelpers.java <<'EOF'
+          package de.robv.android.xposed;
+          public final class XposedHelpers {
+              public static Class<?> findClass(String name, ClassLoader cl) { return null; }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="iOS 27 Animations" android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="iOS-style push/pop transitions for One UI 8" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>android</item>
+              </string-array>
+          </resources>
+          EOF
+          echo "com.ios27.anim.IosHook" > app/src/main/assets/xposed_init
+
+          cat > $D/IosAnimations.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.view.animation.AlphaAnimation;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationSet;
+          import android.view.animation.PathInterpolator;
+          import android.view.animation.TranslateAnimation;
+
+          final class IosAnimations {
+              static final long DURATION = 500;
+              static final float PARALLAX = 0.30f;
+
+              private IosAnimations() {}
+
+              static Animation build(String name) {
+                  if (name == null || !name.startsWith("activity_")) return null;
+                  if (name.contains("translucent") || name.contains("dream") || name.contains("wallpaper")) return null;
+                  if (name.contains("open_enter"))  return slide(1f, 0f);
+                  if (name.contains("open_exit"))   return slide(0f, -PARALLAX);
+                  if (name.contains("close_enter")) return slide(-PARALLAX, 0f);
+                  if (name.contains("close_exit"))  return slide(0f, 1f);
+                  return null;
+              }
+
+              private static Animation slide(float fromX, float toX) {
+                  AnimationSet set = new AnimationSet(false);
+                  TranslateAnimation t = new TranslateAnimation(
+                          Animation.RELATIVE_TO_PARENT, fromX,
+                          Animation.RELATIVE_TO_PARENT, toX,
+                          Animation.ABSOLUTE, 0f,
+                          Animation.ABSOLUTE, 0f);
+                  t.setInterpolator(new PathInterpolator(0.32f, 0.72f, 0f, 1f));
+                  t.setDuration(DURATION);
+                  t.setFillEnabled(true);
+                  t.setFillBefore(true);
+                  t.setFillAfter(true);
+                  set.addAnimation(t);
+                  AlphaAnimation a = new AlphaAnimation(1f, 1f);
+                  a.setDuration(DURATION);
+                  a.setFillEnabled(true);
+                  a.setFillBefore(true);
+                  a.setFillAfter(true);
+                  set.addAnimation(a);
+                  set.setDuration(DURATION);
+                  return set;
+              }
+          }
+          EOF
+
+          cat > $D/IosHook.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.content.Context;
+          import android.content.res.Resources;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationUtils;
+
+          import java.util.Collections;
+          import java.util.HashSet;
+          import java.util.Set;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          public class IosHook implements IXposedHookLoadPackage {
+              private static final String TAG = "[iOS27] ";
+              private static final Set<String> SEEN = Collections.synchronizedSet(new HashSet<String>());
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+                  if (!"android".equals(lp.packageName)) return;
+                  XposedBridge.log(TAG + "loaded in system_server");
+
+                  XC_MethodHook hook = new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam param) {
+                          try {
+                              if (param.args == null || param.args.length < 2) return;
+                              if (!(param.args[0] instanceof Context)) return;
+                              if (!(param.args[1] instanceof Integer)) return;
+                              Resources res = ((Context) param.args[0]).getResources();
+                              int id = (Integer) param.args[1];
+                              if (!"android".equals(res.getResourcePackageName(id))) return;
+                              String name = res.getResourceEntryName(id);
+                              if (SEEN.add(name)) XposedBridge.log(TAG + "anim requested: " + name);
+                              Animation a = IosAnimations.build(name);
+                              if (a != null) param.setResult(a);
+                          } catch (Throwable ignored) { }
+                      }
+                  };
+
+                  try {
+                      Class<?> ta = XposedHelpers.findClass(
+                              "com.android.internal.policy.TransitionAnimation", lp.classLoader);
+                      Set<?> s = XposedBridge.hookAllMethods(ta, "loadAnimationSafely", hook);
+                      XposedBridge.log(TAG + "TransitionAnimation hooks: " + (s == null ? 0 : s.size()));
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "TransitionAnimation failed: " + t);
+                  }
+                  try {
+                      Set<?> s = XposedBridge.hookAllMethods(AnimationUtils.class, "loadAnimation", hook);
+                      XposedBridge.log(TAG + "AnimationUtils hooks: " + (s == null ? 0 : s.size()));
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "AnimationUtils failed: " + t);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iOS27-LSPosed-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+    
