@@ -94,6 +94,15 @@ jobs:
               public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> c, String name, XC_MethodHook cb) { return null; }
           }
           EOF
+          cat > $S/XSharedPreferences.java <<'EOF'
+          package de.robv.android.xposed;
+          public class XSharedPreferences {
+              public XSharedPreferences(String packageName, String prefFileName) {}
+              public boolean reload() { return false; }
+              public boolean getBoolean(String key, boolean def) { return def; }
+              public int getInt(String key, int def) { return def; }
+          }
+          EOF
           cat > $S/XposedHelpers.java <<'EOF'
           package de.robv.android.xposed;
           public final class XposedHelpers {
@@ -104,10 +113,18 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <application android:label="iOS 27 Animations" android:allowBackup="false">
+              <application android:label="iOS 27 Animations" android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.DayNight">
+                  <activity android:name=".SettingsActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
                   <meta-data android:name="xposedmodule" android:value="true" />
-                  <meta-data android:name="xposeddescription" android:value="iOS-style push/pop transitions for One UI 8" />
+                  <meta-data android:name="xposeddescription" android:value="iOS-style transitions with an in-app tuner" />
                   <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data android:name="xposedsharedprefs" android:value="true" />
                   <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
               </application>
           </manifest>
@@ -122,52 +139,135 @@ jobs:
           EOF
           echo "com.ios27.anim.IosHook" > app/src/main/assets/xposed_init
 
+          cat > $D/IosConfig.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.os.SystemClock;
+          import android.view.animation.Interpolator;
+          import android.view.animation.LinearInterpolator;
+          import android.view.animation.PathInterpolator;
+
+          import de.robv.android.xposed.XSharedPreferences;
+
+          final class IosConfig {
+              static final String PKG = "com.ios27.anim";
+              static final String PREFS = "settings";
+
+              boolean enabled = true;
+              int duration = 500;   // ms
+              int parallax = 30;    // % of screen width the old screen moves
+              int curve = 0;        // 0 iOS, 1 Smooth, 2 Snappy, 3 Linear
+              int style = 0;        // 0 Push, 1 Sheet (slide up), 2 Zoom
+              int dim = 0;          // % the old screen darkens
+
+              private static XSharedPreferences xsp;
+              private static long last = -5000;
+              private static IosConfig cur = new IosConfig();
+
+              static synchronized IosConfig get() {
+                  long now = SystemClock.uptimeMillis();
+                  if (now - last < 800) return cur;
+                  last = now;
+                  try {
+                      if (xsp == null) xsp = new XSharedPreferences(PKG, PREFS);
+                      else xsp.reload();
+                      IosConfig c = new IosConfig();
+                      c.enabled = xsp.getBoolean("enabled", true);
+                      c.duration = xsp.getInt("duration", 500);
+                      c.parallax = xsp.getInt("parallax", 30);
+                      c.curve = xsp.getInt("curve", 0);
+                      c.style = xsp.getInt("style", 0);
+                      c.dim = xsp.getInt("dim", 0);
+                      cur = c;
+                  } catch (Throwable ignored) { }
+                  return cur;
+              }
+
+              Interpolator interpolator() {
+                  switch (curve) {
+                      case 1: return new PathInterpolator(0.25f, 0.1f, 0.25f, 1f);
+                      case 2: return new PathInterpolator(0.2f, 0.9f, 0.1f, 1f);
+                      case 3: return new LinearInterpolator();
+                      default: return new PathInterpolator(0.32f, 0.72f, 0f, 1f);
+                  }
+              }
+          }
+          EOF
+
           cat > $D/IosAnimations.java <<'EOF'
           package com.ios27.anim;
 
           import android.view.animation.AlphaAnimation;
           import android.view.animation.Animation;
           import android.view.animation.AnimationSet;
-          import android.view.animation.PathInterpolator;
+          import android.view.animation.ScaleAnimation;
           import android.view.animation.TranslateAnimation;
 
           final class IosAnimations {
-              static final long DURATION = 500;
-              static final float PARALLAX = 0.30f;
-
               private IosAnimations() {}
 
-              static Animation build(String name) {
+              static Animation build(String name, IosConfig c) {
                   if (name == null || !name.startsWith("activity_")) return null;
                   if (name.contains("translucent") || name.contains("dream") || name.contains("wallpaper")) return null;
-                  if (name.contains("open_enter"))  return slide(1f, 0f);
-                  if (name.contains("open_exit"))   return slide(0f, -PARALLAX);
-                  if (name.contains("close_enter")) return slide(-PARALLAX, 0f);
-                  if (name.contains("close_exit"))  return slide(0f, 1f);
-                  return null;
+                  boolean oe = name.contains("open_enter");
+                  boolean ox = name.contains("open_exit");
+                  boolean ce = name.contains("close_enter");
+                  boolean cx = name.contains("close_exit");
+                  if (!(oe || ox || ce || cx)) return null;
+
+                  float p = c.parallax / 100f;
+                  float dim = 1f - c.dim / 100f;
+                  float a0 = 1f, a1 = 1f;
+                  if (ox) a1 = dim;
+                  else if (ce) a0 = dim;
+
+                  AnimationSet set = new AnimationSet(false);
+                  switch (c.style) {
+                      case 1: // Sheet: new screen slides up from the bottom
+                          if (oe) set.addAnimation(move(0f, 0f, 1f, 0f, c));
+                          else if (cx) set.addAnimation(move(0f, 0f, 0f, 1f, c));
+                          break;
+                      case 2: // Zoom
+                          if (oe) { set.addAnimation(zoom(0.85f, 1f, c)); a0 = 0f; }
+                          else if (ox) set.addAnimation(zoom(1f, 0.94f, c));
+                          else if (ce) set.addAnimation(zoom(0.94f, 1f, c));
+                          else { set.addAnimation(zoom(1f, 0.85f, c)); a1 = 0f; }
+                          break;
+                      default: // Push (iOS navigation)
+                          if (oe) set.addAnimation(move(1f, 0f, 0f, 0f, c));
+                          else if (ox) set.addAnimation(move(0f, -p, 0f, 0f, c));
+                          else if (ce) set.addAnimation(move(-p, 0f, 0f, 0f, c));
+                          else set.addAnimation(move(0f, 1f, 0f, 0f, c));
+                  }
+
+                  AlphaAnimation fade = new AlphaAnimation(a0, a1);
+                  setup(fade, c);
+                  set.addAnimation(fade);
+                  set.setDuration(c.duration);
+                  return set;
               }
 
-              private static Animation slide(float fromX, float toX) {
-                  AnimationSet set = new AnimationSet(false);
+              private static Animation move(float fx, float tx, float fy, float ty, IosConfig c) {
                   TranslateAnimation t = new TranslateAnimation(
-                          Animation.RELATIVE_TO_PARENT, fromX,
-                          Animation.RELATIVE_TO_PARENT, toX,
-                          Animation.ABSOLUTE, 0f,
-                          Animation.ABSOLUTE, 0f);
-                  t.setInterpolator(new PathInterpolator(0.32f, 0.72f, 0f, 1f));
-                  t.setDuration(DURATION);
-                  t.setFillEnabled(true);
-                  t.setFillBefore(true);
-                  t.setFillAfter(true);
-                  set.addAnimation(t);
-                  AlphaAnimation a = new AlphaAnimation(1f, 1f);
-                  a.setDuration(DURATION);
+                          Animation.RELATIVE_TO_PARENT, fx, Animation.RELATIVE_TO_PARENT, tx,
+                          Animation.RELATIVE_TO_PARENT, fy, Animation.RELATIVE_TO_PARENT, ty);
+                  setup(t, c);
+                  return t;
+              }
+
+              private static Animation zoom(float from, float to, IosConfig c) {
+                  ScaleAnimation s = new ScaleAnimation(from, to, from, to,
+                          Animation.RELATIVE_TO_SELF, 0.5f, Animation.RELATIVE_TO_SELF, 0.5f);
+                  setup(s, c);
+                  return s;
+              }
+
+              private static void setup(Animation a, IosConfig c) {
+                  a.setInterpolator(c.interpolator());
+                  a.setDuration(c.duration);
                   a.setFillEnabled(true);
                   a.setFillBefore(true);
                   a.setFillAfter(true);
-                  set.addAnimation(a);
-                  set.setDuration(DURATION);
-                  return set;
               }
           }
           EOF
@@ -211,7 +311,9 @@ jobs:
                               if (!"android".equals(res.getResourcePackageName(id))) return;
                               String name = res.getResourceEntryName(id);
                               if (SEEN.add(name)) XposedBridge.log(TAG + "anim requested: " + name);
-                              Animation a = IosAnimations.build(name);
+                              IosConfig c = IosConfig.get();
+                              if (!c.enabled) return;
+                              Animation a = IosAnimations.build(name, c);
                               if (a != null) param.setResult(a);
                           } catch (Throwable ignored) { }
                       }
@@ -235,6 +337,140 @@ jobs:
           }
           EOF
 
+          cat > $D/SettingsActivity.java <<'EOF'
+          package com.ios27.anim;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.RadioButton;
+          import android.widget.RadioGroup;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          public class SettingsActivity extends Activity {
+              private SharedPreferences sp;
+              private LinearLayout root;
+
+              @Override
+              @SuppressWarnings("deprecation")
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  boolean shared = true;
+                  try {
+                      sp = getSharedPreferences(IosConfig.PREFS, MODE_WORLD_READABLE);
+                  } catch (Throwable t) {
+                      shared = false;
+                      sp = getSharedPreferences(IosConfig.PREFS, MODE_PRIVATE);
+                  }
+
+                  ScrollView sv = new ScrollView(this);
+                  root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int pad = dp(20);
+                  root.setPadding(pad, dp(36), pad, dp(40));
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  label("iOS 27 Animations", 26, true);
+                  if (shared) label("Changes apply to the next app you open. No reboot needed.", 13, false);
+                  else label("LSPosed does not seem active for this app, so settings will not reach the system.", 13, false);
+
+                  Switch sw = new Switch(this);
+                  sw.setText("Enabled");
+                  sw.setChecked(sp.getBoolean("enabled", true));
+                  sw.setOnCheckedChangeListener((v, on) -> sp.edit().putBoolean("enabled", on).apply());
+                  root.addView(sw);
+
+                  label("Presets", 18, true);
+                  preset("iOS (default)", 500, 30, 0, 0, 0);
+                  preset("Snappy", 320, 25, 2, 0, 0);
+                  preset("Smooth and soft", 650, 35, 1, 0, 12);
+                  preset("Sheet (slide up)", 480, 0, 0, 1, 0);
+                  preset("Zoom", 420, 0, 0, 2, 0);
+
+                  label("Style", 18, true);
+                  radio("Style", "style", new String[] {"Push (slide sideways)", "Sheet (slide up)", "Zoom"}, 0);
+                  radio("Curve", "curve", new String[] {"iOS", "Smooth", "Snappy", "Linear"}, 0);
+
+                  label("Speed and feel", 18, true);
+                  seek("Duration", "duration", 150, 1000, 500, " ms");
+                  seek("Old screen movement", "parallax", 0, 60, 30, " %");
+                  seek("Old screen dimming", "dim", 0, 50, 0, " %");
+
+                  Button test = new Button(this);
+                  test.setText("Try it (opens this screen again)");
+                  test.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
+                  root.addView(test);
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private TextView label(String s, int size, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setPadding(0, dp(14), 0, dp(4));
+                  root.addView(t);
+                  return t;
+              }
+
+              private void seek(final String name, final String key, final int min, int max, int def, final String unit) {
+                  final TextView tv = label("", 15, false);
+                  int cur = sp.getInt(key, def);
+                  tv.setText(name + ": " + cur + unit);
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMax(max - min);
+                  sb.setProgress(cur - min);
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean user) {
+                          int v = p + min;
+                          tv.setText(name + ": " + v + unit);
+                          if (user) sp.edit().putInt(key, v).apply();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar s) { }
+                      @Override public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  root.addView(sb);
+              }
+
+              private void radio(String name, final String key, String[] opts, int def) {
+                  label(name, 15, false);
+                  RadioGroup g = new RadioGroup(this);
+                  for (int i = 0; i < opts.length; i++) {
+                      RadioButton r = new RadioButton(this);
+                      r.setText(opts[i]);
+                      r.setId(1000 + i);
+                      g.addView(r);
+                  }
+                  g.check(1000 + sp.getInt(key, def));
+                  g.setOnCheckedChangeListener((grp, id) -> sp.edit().putInt(key, id - 1000).apply());
+                  root.addView(g);
+              }
+
+              private void preset(String name, final int d, final int p, final int c, final int s, final int dim) {
+                  Button bt = new Button(this);
+                  bt.setText(name);
+                  bt.setOnClickListener(v -> {
+                      sp.edit().putInt("duration", d).putInt("parallax", p).putInt("curve", c)
+                              .putInt("style", s).putInt("dim", dim).apply();
+                      recreate();
+                  });
+                  root.addView(bt);
+              }
+          }
+          EOF
+
       - name: Build APK
         run: gradle :app:assembleDebug --no-daemon
 
@@ -242,4 +478,3 @@ jobs:
         with:
           name: iOS27-LSPosed-APK
           path: app/build/outputs/apk/debug/app-debug.apk
-    
